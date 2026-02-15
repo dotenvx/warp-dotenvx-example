@@ -46,6 +46,27 @@ jobs:
           declare -A key_file_by_env
           declare -A all_keys
 
+          expected_public_key_for_file() {
+            local file="$1"
+            local base
+            base="$(basename "$file")"
+
+            if [ "$base" = ".env" ]; then
+              echo "DOTENV_PUBLIC_KEY"
+              return
+            fi
+
+            if [[ "$base" == .env.* ]]; then
+              local suffix="${base#.env.}"
+              suffix="$(echo "$suffix" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
+              suffix="$(echo "$suffix" | sed 's/^_*//; s/_*$//')"
+              echo "DOTENV_PUBLIC_KEY_${suffix}"
+              return
+            fi
+
+            echo "DOTENV_PUBLIC_KEY"
+          }
+
           extract_keys() {
             local file="$1"
             awk '
@@ -68,9 +89,19 @@ jobs:
 
             while IFS= read -r key; do
               [ -z "$key" ] && continue
+              if [[ "$key" =~ ^DOTENV_PUBLIC_KEY(_[A-Z0-9_]+)?$ ]]; then
+                continue
+              fi
               all_keys["$key"]=1
             done < "$key_file"
           done
+
+          echo "" >> env_drift_context.md
+          echo "## Special Key Rule" >> env_drift_context.md
+          echo "- Use file-specific dotenvx public key names:" >> env_drift_context.md
+          echo "  - .env -> DOTENV_PUBLIC_KEY" >> env_drift_context.md
+          echo "  - .env.<target> -> DOTENV_PUBLIC_KEY_<TARGET_UPPERCASE>" >> env_drift_context.md
+          echo "  - Examples: .env.production -> DOTENV_PUBLIC_KEY_PRODUCTION, .env.ci -> DOTENV_PUBLIC_KEY_CI" >> env_drift_context.md
 
           echo "" >> env_drift_context.md
           echo "## Missing Keys By File" >> env_drift_context.md
@@ -85,6 +116,13 @@ jobs:
                 missing_keys+="$key "
               fi
             done
+
+            missing_keys="$(echo "$missing_keys" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+
+            expected_public_key="$(expected_public_key_for_file "$env_file")"
+            if ! grep -Fxq "$expected_public_key" "$key_file"; then
+              missing_keys+="$expected_public_key "
+            fi
 
             missing_keys="$(echo "$missing_keys" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
             if [ -n "$missing_keys" ]; then
@@ -135,6 +173,10 @@ jobs:
             - Exclude .env.keys.
             - Compare variable keys only, not values.
             - Focus on drift: keys that exist in one .env* file but are missing in others.
+            - Special handling for dotenvx public keys:
+              - `.env` expects `DOTENV_PUBLIC_KEY`.
+              - `.env.<target>` expects `DOTENV_PUBLIC_KEY_<TARGET_UPPERCASE>` (example: `.env.production` => `DOTENV_PUBLIC_KEY_PRODUCTION`).
+              - Treat these as environment-specific equivalents, not global cross-file drift keys.
             - Provide concrete fixes (keys to add) for missing files.
             - If inline comments are possible, use them. If not, put fix suggestions in summary.
 
