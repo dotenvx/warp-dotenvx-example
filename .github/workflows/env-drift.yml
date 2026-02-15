@@ -1,0 +1,289 @@
+name: Env Drift
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  env-drift:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Prepare Env Drift Context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh pr checkout ${{ github.event.pull_request.number }}
+          git fetch origin ${{ github.event.pull_request.base.ref }}
+
+          git diff ${{ github.event.pull_request.base.sha }}...HEAD -- '.env*' ':(exclude).env.keys' > env_diff.patch || true
+
+          echo "# Env Drift Context" > env_drift_context.md
+
+          mapfile -t env_files < <(find . -type f -name '.env*' ! -name '.env.keys' | sort)
+
+          if [ "${#env_files[@]}" -eq 0 ]; then
+            echo "No .env* files found." >> env_drift_context.md
+            exit 0
+          fi
+
+          echo "## Files" >> env_drift_context.md
+          printf -- "- %s\n" "${env_files[@]}" >> env_drift_context.md
+
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+
+          declare -A key_file_by_env
+          declare -A all_keys
+
+          extract_keys() {
+            local file="$1"
+            awk '
+              /^[[:space:]]*#/ { next }
+              /^[[:space:]]*$/ { next }
+              {
+                line = $0
+                sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+                if (match(line, /^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=/, m)) {
+                  print m[1]
+                }
+              }
+            ' "$file" | sort -u
+          }
+
+          for env_file in "${env_files[@]}"; do
+            key_file="$tmp_dir/$(echo "$env_file" | tr '/.' '__').keys"
+            extract_keys "$env_file" > "$key_file"
+            key_file_by_env["$env_file"]="$key_file"
+
+            while IFS= read -r key; do
+              [ -z "$key" ] && continue
+              all_keys["$key"]=1
+            done < "$key_file"
+          done
+
+          echo "" >> env_drift_context.md
+          echo "## Missing Keys By File" >> env_drift_context.md
+
+          missing_any=0
+          for env_file in "${env_files[@]}"; do
+            missing_keys=""
+            key_file="${key_file_by_env[$env_file]}"
+
+            for key in "${!all_keys[@]}"; do
+              if ! grep -Fxq "$key" "$key_file"; then
+                missing_keys+="$key "
+              fi
+            done
+
+            missing_keys="$(echo "$missing_keys" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+            if [ -n "$missing_keys" ]; then
+              missing_any=1
+              echo "- $env_file: $missing_keys" >> env_drift_context.md
+            fi
+          done
+
+          if [ "$missing_any" -eq 0 ]; then
+            echo "- No drift detected" >> env_drift_context.md
+          fi
+
+          echo "" >> env_drift_context.md
+          echo "## Env Diff In This PR" >> env_drift_context.md
+          if [ -s env_diff.patch ]; then
+            cat env_diff.patch >> env_drift_context.md
+          else
+            echo "No .env* diff in this PR." >> env_drift_context.md
+          fi
+
+      - name: Construct Warp Prompt
+        id: prompt
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request.number;
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+
+            const contextDoc = fs.existsSync('env_drift_context.md')
+              ? fs.readFileSync('env_drift_context.md', 'utf8')
+              : 'No env context available.';
+
+            const prompt = `You are an expert reviewer focused only on env drift across .env* files.
+
+            PR #${prNumber}
+            Title: ${pr.title}
+            Description: ${pr.body || 'No description provided.'}
+
+            Rules:
+            - Scope ONLY to .env* files.
+            - Exclude .env.keys.
+            - Compare variable keys only, not values.
+            - Focus on drift: keys that exist in one .env* file but are missing in others.
+            - Provide concrete fixes (keys to add) for missing files.
+            - If inline comments are possible, use them. If not, put fix suggestions in summary.
+
+            Context:
+            ${contextDoc}
+
+            Output requirements:
+            - Create review.json in repo root.
+            - Ensure valid JSON (validate with jq).
+            - Use this exact schema:
+            {
+              "summary": "markdown summary with findings and suggested fixes",
+              "comments": [
+                {
+                  "path": "relative/path",
+                  "line": 1,
+                  "side": "RIGHT",
+                  "start_line": 1,
+                  "body": "⚠️ [IMPORTANT] ...\\n\\n\\`\\`\\`suggestion\\nKEY=\\n\\`\\`\\`"
+                }
+              ]
+            }
+
+            Constraints:
+            - Only include inline comments when line/path are valid for this PR diff.
+            - If there are no valid inline comments, return comments: [] and keep full guidance in summary.
+            - Keep guidance concise and actionable.
+            `;
+
+            core.setOutput('prompt', prompt);
+
+      - name: Run Warp Agent Env Drift Review
+        uses: warpdotdev/warp-agent-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          warp_api_key: ${{ secrets.WARP_API_KEY }}
+          profile: ${{ vars.WARP_AGENT_PROFILE || '' }}
+
+      - name: Post Review
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request.number;
+
+            try {
+              if (!fs.existsSync('review.json')) {
+                console.log('No review.json found. Skipping review posting.');
+                return;
+              }
+
+              const reviewContent = fs.readFileSync('review.json', 'utf8');
+
+              let review;
+              try {
+                review = JSON.parse(reviewContent);
+              } catch (parseError) {
+                core.warning(
+                  `Failed to parse review.json (likely due to control characters). Attempting sanitize. Original error: ${parseError.message}`
+                );
+                const sanitized = reviewContent.replace(/[\u0000-\u001F]+/g, ' ');
+                try {
+                  review = JSON.parse(sanitized);
+                } catch (sanitizedError) {
+                  core.setFailed(`Failed to parse review.json after sanitizing: ${sanitizedError.message}`);
+                  return;
+                }
+              }
+
+              const decodeNewlines = (text) => {
+                if (typeof text !== 'string') return text;
+                return text.replace(/\r\n/g, '\n').replace(/\\n/g, '\n');
+              };
+
+              const rawComments = Array.isArray(review.comments) ? review.comments : [];
+
+              const prFiles = await github.paginate(
+                github.rest.pulls.listFiles,
+                { owner, repo, pull_number: prNumber }
+              );
+              const validPaths = new Set(prFiles.map(f => f.filename));
+
+              const comments = [];
+
+              for (const c of rawComments) {
+                if (!c || typeof c !== 'object') continue;
+                if (typeof c.body !== 'string' || !c.body.trim()) continue;
+                if (typeof c.path !== 'string' || !c.path.trim()) continue;
+
+                const normalizedPath = c.path.trim()
+                  .replace(/^([ab]\/)+/, '')
+                  .replace(/^\.\//, '');
+
+                if (!validPaths.has(normalizedPath)) continue;
+
+                const line = Number(c.line);
+                if (!Number.isInteger(line) || line <= 0) continue;
+
+                let side = (c.side || 'RIGHT').toString().toUpperCase();
+                if (side !== 'LEFT' && side !== 'RIGHT') side = 'RIGHT';
+
+                let startLine;
+                if (c.start_line !== undefined && c.start_line !== null) {
+                  startLine = Number(c.start_line);
+                  if (!Number.isInteger(startLine) || startLine <= 0 || startLine === line || startLine > line) {
+                    startLine = undefined;
+                  }
+                }
+
+                const commentPayload = {
+                  path: normalizedPath,
+                  line,
+                  side,
+                  body: decodeNewlines(c.body),
+                };
+
+                if (startLine && startLine < line) {
+                  commentPayload.start_line = startLine;
+                  commentPayload.start_side = side;
+                }
+
+                comments.push(commentPayload);
+              }
+
+              const summary = typeof review.summary === 'string' ? decodeNewlines(review.summary).trim() : '';
+              const hasSummary = summary.length > 0;
+
+              if (!hasSummary && comments.length === 0) {
+                console.log('No valid summary or inline comments found. Skipping review posting.');
+                return;
+              }
+
+              const payload = {
+                owner,
+                repo,
+                pull_number: prNumber,
+                event: 'COMMENT',
+                body: hasSummary ? summary : 'Automated env drift review by Warp Agent',
+              };
+
+              if (comments.length > 0) payload.comments = comments;
+
+              await github.rest.pulls.createReview(payload);
+              console.log('Review posted successfully.');
+            } catch (error) {
+              console.error('Failed to post review:', error);
+              core.setFailed(`Failed to post review: ${error.message}`);
+            }
