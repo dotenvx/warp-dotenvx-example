@@ -153,7 +153,7 @@ jobs:
                   "line": 1,
                   "side": "RIGHT",
                   "start_line": 1,
-                  "body": "⚠️ [IMPORTANT] ...\\n\\n\\`\\`\\`suggestion\\nKEY=\\n\\`\\`\\`"
+                  "body": "⚠️ [IMPORTANT] Missing key in this file. Suggested fix: add KEY="
                 }
               ]
             }
