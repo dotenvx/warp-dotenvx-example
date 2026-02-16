@@ -1,0 +1,19 @@
+name: Env Drift Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  env-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dotenvx/wizard-of-drift@v1
+        with:
+          warp_api_key: ${{ secrets.WARP_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          warp_agent_profile: "" # optional
